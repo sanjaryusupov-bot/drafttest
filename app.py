@@ -5,6 +5,7 @@ import pandas as pd
 import gspread
 import tempfile
 import os
+import time
 from datetime import datetime, timedelta
 
 from google.oauth2.service_account import Credentials
@@ -117,73 +118,135 @@ def get_data():
         st.error(f"❌ Ошибка чтения: {str(e)}")
         return pd.DataFrame()
 
-def update_routes(routes_list, car_number, driver, plomb, trip_number):
+def update_routes_batch(routes_list, car_number, driver, plomb, trip_number):
+    """Пакетное обновление данных - БЕЗ ПРЕВЫШЕНИЯ ЛИМИТОВ"""
     sheet = connect_sheet()
     if sheet is None:
         return False
     
     try:
-        data = sheet.get_all_records()
-        headers = sheet.row_values(1)
-
-        extra_columns = ["Номер машины", "Водитель", "№ пломбы", "Дата отгрузки факт", "Рейс"]
-        current_headers = headers.copy()
-
-        for col_name in extra_columns:
-            if col_name not in current_headers:
-                sheet.update_cell(1, len(current_headers) + 1, col_name)
-                current_headers.append(col_name)
-
-        headers = sheet.row_values(1)
-        status_col = headers.index("Статус отгрузки") + 1
-        fact_col = headers.index("Дата отгрузки факт") + 1
-        car_col = headers.index("Номер машины") + 1
-        driver_col = headers.index("Водитель") + 1
-        plomb_col = headers.index("№ пломбы") + 1
-        trip_col = headers.index("Рейс") + 1
-
-        # UTC+5 (Ташкент)
-        now_utc_plus_5 = datetime.now() + timedelta(hours=5)
+        # Получаем все данные
+        all_data = sheet.get_all_values()
+        headers = all_data[0]
         
-        for idx, row in enumerate(data, start=2):
-            if str(row["Номер маршрута"]) in [str(r) for r in routes_list]:
-                sheet.update_cell(idx, status_col, "ОТГРУЖЕН")
-                sheet.update_cell(idx, fact_col, now_utc_plus_5.strftime("%d.%m.%Y %H:%M"))
-                sheet.update_cell(idx, car_col, car_number)
-                sheet.update_cell(idx, driver_col, driver)
-                sheet.update_cell(idx, plomb_col, plomb)
-                sheet.update_cell(idx, trip_col, trip_number)
+        # Находим индексы колонок
+        col_indices = {
+            'status': headers.index("Статус отгрузки"),
+            'fact': headers.index("Дата отгрузки факт") if "Дата отгрузки факт" in headers else None,
+            'car': headers.index("Номер машины") if "Номер машины" in headers else None,
+            'driver': headers.index("Водитель") if "Водитель" in headers else None,
+            'plomb': headers.index("№ пломбы") if "№ пломбы" in headers else None,
+            'trip': headers.index("Рейс") if "Рейс" in headers else None,
+        }
+        
+        # Добавляем недостающие колонки
+        if col_indices['fact'] is None:
+            sheet.add_cols(5)
+            all_data = sheet.get_all_values()
+            headers = all_data[0]
+            col_indices['fact'] = headers.index("Дата отгрузки факт")
+            col_indices['car'] = headers.index("Номер машины")
+            col_indices['driver'] = headers.index("Водитель")
+            col_indices['plomb'] = headers.index("№ пломбы")
+            col_indices['trip'] = headers.index("Рейс")
+        
+        # UTC+5
+        now_utc_plus_5 = datetime.now() + timedelta(hours=5)
+        fact_date = now_utc_plus_5.strftime("%d.%m.%Y %H:%M")
+        
+        # Подготавливаем обновления
+        updates = []
+        route_indices = [str(r) for r in routes_list]
+        
+        for idx, row in enumerate(all_data[1:], start=2):
+            if len(row) > headers.index("Номер маршрута") and str(row[headers.index("Номер маршрута")]) in route_indices:
+                updates.append({
+                    'range': f'{chr(65 + col_indices["status"])}{idx}',
+                    'value': "ОТГРУЖЕН"
+                })
+                updates.append({
+                    'range': f'{chr(65 + col_indices["fact"])}{idx}',
+                    'value': fact_date
+                })
+                updates.append({
+                    'range': f'{chr(65 + col_indices["car"])}{idx}',
+                    'value': car_number
+                })
+                updates.append({
+                    'range': f'{chr(65 + col_indices["driver"])}{idx}',
+                    'value': driver
+                })
+                updates.append({
+                    'range': f'{chr(65 + col_indices["plomb"])}{idx}',
+                    'value': plomb
+                })
+                updates.append({
+                    'range': f'{chr(65 + col_indices["trip"])}{idx}',
+                    'value': trip_number
+                })
+        
+        # Пакетное обновление (максимум 100 ячеек за раз)
+        if updates:
+            batch = []
+            for i, update in enumerate(updates):
+                batch.append(update)
+                # Отправляем каждые 50 обновлений или в конце
+                if len(batch) >= 50 or i == len(updates) - 1:
+                    sheet.batch_update([{
+                        'range': u['range'],
+                        'values': [[u['value']]]
+                    } for u in batch])
+                    batch = []
+                    time.sleep(0.5)  # Пауза, чтобы не превысить лимит
         
         return True
+        
     except Exception as e:
         st.error(f"❌ Ошибка обновления: {str(e)}")
         return False
 
-def rollback_orders(order_numbers):
+def rollback_orders_batch(order_numbers):
+    """Пакетный откат заказов"""
     sheet = connect_sheet()
     if sheet is None:
         return False
     
     try:
-        data = sheet.get_all_records()
-        headers = sheet.row_values(1)
+        all_data = sheet.get_all_values()
+        headers = all_data[0]
         
-        status_col = headers.index("Статус отгрузки") + 1
-        fact_col = headers.index("Дата отгрузки факт") + 1
-        car_col = headers.index("Номер машины") + 1
-        driver_col = headers.index("Водитель") + 1
-        plomb_col = headers.index("№ пломбы") + 1
-        trip_col = headers.index("Рейс") + 1
+        col_indices = {
+            'status': headers.index("Статус отгрузки"),
+            'fact': headers.index("Дата отгрузки факт"),
+            'car': headers.index("Номер машины"),
+            'driver': headers.index("Водитель"),
+            'plomb': headers.index("№ пломбы"),
+            'trip': headers.index("Рейс"),
+        }
         
-        for idx, row in enumerate(data, start=2):
-            if str(row["№ заказа"]) in [str(o) for o in order_numbers]:
-                sheet.update_cell(idx, status_col, "")
-                sheet.update_cell(idx, fact_col, "")
-                sheet.update_cell(idx, car_col, "")
-                sheet.update_cell(idx, driver_col, "")
-                sheet.update_cell(idx, plomb_col, "")
-                sheet.update_cell(idx, trip_col, "")
+        updates = []
+        order_strs = [str(o) for o in order_numbers]
+        
+        for idx, row in enumerate(all_data[1:], start=2):
+            if len(row) > headers.index("№ заказа") and str(row[headers.index("№ заказа")]) in order_strs:
+                updates.append({'range': f'{chr(65 + col_indices["status"])}{idx}', 'value': ""})
+                updates.append({'range': f'{chr(65 + col_indices["fact"])}{idx}', 'value': ""})
+                updates.append({'range': f'{chr(65 + col_indices["car"])}{idx}', 'value': ""})
+                updates.append({'range': f'{chr(65 + col_indices["driver"])}{idx}', 'value': ""})
+                updates.append({'range': f'{chr(65 + col_indices["plomb"])}{idx}', 'value': ""})
+                updates.append({'range': f'{chr(65 + col_indices["trip"])}{idx}', 'value': ""})
+        
+        if updates:
+            batch = []
+            for i, update in enumerate(updates):
+                batch.append(update)
+                if len(batch) >= 50 or i == len(updates) - 1:
+                    sheet.batch_update([{'range': u['range'], 'values': [[u['value']]]} for u in batch])
+                    batch = []
+                    time.sleep(0.5)
+        
         return True
+        
     except Exception as e:
         st.error(f"❌ Ошибка отката: {str(e)}")
         return False
@@ -213,11 +276,9 @@ def generate_delivery_pdf(all_data, routes_list, driver, car, plomb, trip_number
     elements = []
     total_points = len(all_data)
 
-    # Заголовок
     elements.append(Paragraph("МАРШРУТНЫЙ ЛИСТ ДОСТАВКИ", styleTitle))
     elements.append(Spacer(1, 4))
     
-    # Информация
     elements.append(Paragraph(f"<b>Рейс:</b> {trip_number}", styleInfo))
     elements.append(Paragraph(f"<b>Водитель:</b> {driver}", styleInfo))
     elements.append(Paragraph(f"<b>Машина:</b> {car}", styleInfo))
@@ -228,7 +289,6 @@ def generate_delivery_pdf(all_data, routes_list, driver, car, plomb, trip_number
     elements.append(HRFlowable(width="100%", thickness=1.2, color=colors.black))
     elements.append(Spacer(1, 6))
 
-    # Таблица
     headers = ["№ заказа", "Магазин", "Адрес", "Пломба", "Выдано коробок", "Получено коробок", "Подпись, печать, комментарии", "Подпись водителя"]
     table_data = [[Paragraph(h, styleHeader) for h in headers]]
 
@@ -274,7 +334,6 @@ def generate_delivery_pdf(all_data, routes_list, driver, car, plomb, trip_number
     elements.append(table)
     elements.append(Spacer(1, 20))
     
-    # Подписи
     styleSignatures = ParagraphStyle('CustomSignatures', parent=styles['Normal'], fontName='HYSMyeongJo-Medium', fontSize=10, leading=14, textColor=colors.black)
     elements.append(Spacer(1, 10))
     elements.append(Paragraph("<b>Подпись водителя:</b> _________________________ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Подпись ответственного:</b> _________________________", styleSignatures))
@@ -285,7 +344,6 @@ def generate_delivery_pdf(all_data, routes_list, driver, car, plomb, trip_number
 # ---------------- MAIN ----------------
 st.title("🚚 Система отгрузки маршрутов")
 
-# Загрузка данных
 with st.spinner("Загрузка данных..."):
     df = get_data()
 
@@ -293,11 +351,9 @@ if df.empty:
     st.error("❌ Нет данных")
     st.stop()
 
-# Фильтрация
 not_shipped = df[df["Статус отгрузки"] != "ОТГРУЖЕН"]
 shipped = df[df["Статус отгрузки"] == "ОТГРУЖЕН"]
 
-# Метрики
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Не отгружено", not_shipped["Номер маршрута"].nunique())
 col2.metric("Отгружено", shipped["Номер маршрута"].nunique())
@@ -306,12 +362,10 @@ col4.metric("Кол-во шт", int(not_shipped["кол-во штук в зак�
 
 st.divider()
 
-# Кнопка отката
 if st.button("🔄 Откатить заказы", type="secondary"):
     st.session_state.rollback_mode = True
     st.rerun()
 
-# Режим отката
 if st.session_state.get('rollback_mode', False):
     st.subheader("🔄 Режим отката")
     shipped_orders = shipped[shipped["Статус отгрузки"] == "ОТГРУЖЕН"]
@@ -321,7 +375,7 @@ if st.session_state.get('rollback_mode', False):
         
         col1, col2 = st.columns(2)
         if col1.button("✅ Подтвердить"):
-            if orders_to_rollback and rollback_orders(orders_to_rollback):
+            if orders_to_rollback and rollback_orders_batch(orders_to_rollback):
                 st.success(f"Откачено {len(orders_to_rollback)} заказов")
                 st.session_state.rollback_mode = False
                 st.rerun()
@@ -334,7 +388,6 @@ if st.session_state.get('rollback_mode', False):
             st.session_state.rollback_mode = False
             st.rerun()
 
-# Основная форма
 elif not st.session_state.get('shipment_completed', False):
     col1, col2 = st.columns(2)
     
@@ -364,14 +417,13 @@ elif not st.session_state.get('shipment_completed', False):
         else:
             with st.spinner("Создание PDF..."):
                 data_for_pdf = not_shipped[not_shipped["Номер маршрута"].isin(selected_routes)]
-                if update_routes(selected_routes, car_number, driver, plomb, trip_number):
+                if update_routes_batch(selected_routes, car_number, driver, plomb, trip_number):
                     pdf_file = generate_delivery_pdf(data_for_pdf, selected_routes, driver, car_number, plomb, trip_number)
                     st.session_state.pdf_file = pdf_file
                     st.session_state.shipment_completed = True
                     st.session_state.selected_routes = selected_routes
                     st.rerun()
 
-# Скачивание PDF
 elif st.session_state.get('shipment_completed') and st.session_state.get('pdf_file'):
     st.success(f"✅ Отгружено: {', '.join(str(r) for r in st.session_state.selected_routes)}")
     
