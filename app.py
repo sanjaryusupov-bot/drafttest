@@ -6,7 +6,6 @@ import gspread
 import tempfile
 import os
 from datetime import datetime, timedelta
-import pytz
 
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -160,15 +159,13 @@ def update_routes(routes_list, car_number, driver, plomb, trip_number):
     plomb_col = headers.index("№ пломбы") + 1
     trip_col = headers.index("Рейс") + 1
 
-    # Исправляем часовой пояс (UTC+5)
-    tashkent_tz = pytz.timezone('Asia/Tashkent')
-    now_utc = datetime.now(pytz.UTC)
-    now_tashkent = now_utc.astimezone(tashkent_tz)
+    # Исправляем часовой пояс (UTC+5) - добавляем 5 часов
+    now_utc_plus_5 = datetime.now() + timedelta(hours=5)
     
     for idx, row in enumerate(data, start=2):
         if row["Номер маршрута"] in routes_list:
             sheet.update_cell(idx, status_col, "ОТГРУЖЕН")
-            sheet.update_cell(idx, fact_col, now_tashkent.strftime("%d.%m.%Y %H:%M"))
+            sheet.update_cell(idx, fact_col, now_utc_plus_5.strftime("%d.%m.%Y %H:%M"))
             sheet.update_cell(idx, car_col, car_number)
             sheet.update_cell(idx, driver_col, driver)
             sheet.update_cell(idx, plomb_col, plomb)
@@ -182,11 +179,19 @@ def rollback_orders(order_numbers):
     
     status_col = headers.index("Статус отгрузки") + 1
     fact_col = headers.index("Дата отгрузки факт") + 1
+    car_col = headers.index("Номер машины") + 1
+    driver_col = headers.index("Водитель") + 1
+    plomb_col = headers.index("№ пломбы") + 1
+    trip_col = headers.index("Рейс") + 1
     
     for idx, row in enumerate(data, start=2):
         if row["№ заказа"] in order_numbers:
             sheet.update_cell(idx, status_col, "")  # Очищаем статус
             sheet.update_cell(idx, fact_col, "")   # Очищаем дату
+            sheet.update_cell(idx, car_col, "")    # Очищаем машину
+            sheet.update_cell(idx, driver_col, "") # Очищаем водителя
+            sheet.update_cell(idx, plomb_col, "")  # Очищаем пломбу
+            sheet.update_cell(idx, trip_col, "")   # Очищаем рейс
     return True
 
 def get_shipped_routes():
@@ -416,22 +421,26 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric("Не отгружено", not_shipped["Номер маршрута"].nunique())
 col2.metric("Отгружено", shipped["Номер маршрута"].nunique())
 col3.metric("Точек", len(not_shipped))
-col4.metric("Кол-во шт", int(not_shipped["кол-во штук в заказе"].sum()))
+col4.metric("Кол-во шт", int(not_shipped["кол-во штук в заказе"].sum()) if not not_shipped.empty else 0)
 
 st.divider()
 
 # Итоги по неотгруженным точкам
 st.subheader("📊 Итоги по неотгруженным точкам")
-summary_not_shipped = not_shipped.groupby(["Название магазина", "Адрес магазина"])["кол-во штук в заказе"].sum().reset_index()
-summary_not_shipped.columns = ["Магазин", "Адрес", "Кол-во шт"]
+if not not_shipped.empty:
+    summary_not_shipped = not_shipped.groupby(["Название магазина", "Адрес магазина"])["кол-во штук в заказе"].sum().reset_index()
+    summary_not_shipped.columns = ["Магазин", "Адрес", "Кол-во шт"]
 
-total_shirts = summary_not_shipped["Кол-во шт"].sum()
-summary_with_total = pd.concat([
-    summary_not_shipped,
-    pd.DataFrame([["ИТОГО:", "", total_shirts]], columns=summary_not_shipped.columns)
-])
+    total_shirts = summary_not_shipped["Кол-во шт"].sum()
+    summary_with_total = pd.concat([
+        summary_not_shipped,
+        pd.DataFrame([["ИТОГО:", "", total_shirts]], columns=summary_not_shipped.columns)
+    ])
 
-st.dataframe(summary_with_total, use_container_width=True, height=400, hide_index=True)
+    st.dataframe(summary_with_total, use_container_width=True, height=400, hide_index=True)
+else:
+    st.info("Нет неотгруженных заказов")
+    
 st.divider()
 
 # Режим отката
@@ -490,18 +499,23 @@ elif not st.session_state.shipment_completed:
 
     with right:
         st.subheader("📦 Маршруты")
-        routes = sorted(not_shipped["Номер маршрута"].dropna().unique())
-        selected_routes = st.multiselect("Выберите маршруты", routes)
+        if not not_shipped.empty:
+            routes = sorted(not_shipped["Номер маршрута"].dropna().unique())
+            selected_routes = st.multiselect("Выберите маршруты", routes)
+        else:
+            st.info("Нет доступных маршрутов для отгрузки")
+            selected_routes = []
 
     # Детали выбранных маршрутов
     if selected_routes:
         st.subheader("📋 Детали маршрутов")
         details_df = not_shipped[not_shipped["Номер маршрута"].isin(selected_routes)]
-        st.dataframe(
-            details_df[["№ заказа", "Название магазина", "Адрес магазина", "Номер маршрута", "кол-во штук в заказе"]],
-            use_container_width=True,
-            height=400
-        )
+        if not details_df.empty:
+            st.dataframe(
+                details_df[["№ заказа", "Название магазина", "Адрес магазина", "Номер маршрута", "кол-во штук в заказе"]],
+                use_container_width=True,
+                height=400
+            )
 
     # Кнопка отгрузки
     if st.button("✅ ОТГРУЗИТЬ И СОЗДАТЬ PDF"):
